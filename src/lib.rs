@@ -11,6 +11,8 @@ mod variable;
 pub mod writer;
 pub(crate) mod backends {
     mod file;
+    #[cfg(feature = "http-backend")]
+    pub mod http;
     pub mod memory;
     pub mod mmapfile;
 }
@@ -28,6 +30,8 @@ pub(crate) mod utils {
 mod errors;
 
 pub use backends::memory::InMemoryBackend;
+#[cfg(feature = "http-backend")]
+pub use backends::http::HttpBackend;
 pub use backends::mmapfile::{FileAccessMode, MmapFile};
 pub use core::compression::OmCompressionType;
 pub use core::data_types::OmDataType;
