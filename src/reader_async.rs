@@ -16,6 +16,7 @@ use ndarray::ArrayD;
 use num_traits::Zero;
 use om_file_format_sys::{
     OmHeaderType_t, OmRange_t, om_header_size, om_header_type, om_trailer_size,
+    om_variable_get_children,
 };
 use std::ffi::c_void;
 use std::num::NonZeroUsize;
@@ -48,7 +49,7 @@ impl<Backend: OmFileReaderBackendAsync> OmFileVariableImpl for OmFileReaderAsync
     }
 }
 
-impl<Backend: OmFileReaderBackendAsync> OmFileAsyncReadableImpl<Backend>
+impl<Backend: OmFileReaderBackendAsync + Send + Sync + 'static> OmFileAsyncReadableImpl<Backend>
     for OmFileReaderAsync<Backend>
 {
     async fn new_from_offset(
@@ -61,6 +62,12 @@ impl<Backend: OmFileReaderBackendAsync> OmFileAsyncReadableImpl<Backend>
             variable,
             offset_size,
         })
+    }
+
+    // Overridden so that, for remote backends, child metadata is fetched concurrently
+    // instead of one network round trip at a time.
+    async fn get_child_by_name(&self, name: &str) -> Option<OmFileReaderAsync<Backend>> {
+        find_child_by_name(&self.backend, &self.variable, self.number_of_children(), name).await
     }
 }
 
@@ -183,7 +190,7 @@ impl<'a, Backend: OmFileReaderBackendAsync> OmFileVariableImpl for OmFileAsyncAr
     }
 }
 
-impl<'a, Backend: OmFileReaderBackendAsync> OmFileAsyncReadableImpl<Backend>
+impl<'a, Backend: OmFileReaderBackendAsync + Send + Sync + 'static> OmFileAsyncReadableImpl<Backend>
     for OmFileAsyncArray<'a, Backend>
 {
     async fn new_from_offset(
@@ -196,6 +203,10 @@ impl<'a, Backend: OmFileReaderBackendAsync> OmFileAsyncReadableImpl<Backend>
             variable,
             offset_size: offset,
         })
+    }
+
+    async fn get_child_by_name(&self, name: &str) -> Option<OmFileReaderAsync<Backend>> {
+        find_child_by_name(self.backend, self.variable, self.number_of_children(), name).await
     }
 }
 
@@ -387,3 +398,108 @@ async fn create_variable_from_offset<Backend: OmFileReaderBackendAsync>(
     let var_vec: Vec<u8> = var_data.to_vec();
     OmVariablePtr::new(var_vec)
 }
+
+/// Looks up a child by name, fetching all children's metadata with as few requests as possible.
+///
+/// A linear one-at-a-time scan is fine for local backends, but for remote backends
+/// (e.g. HTTP) each child lookup is a network round trip, so scanning ~100+ children
+/// sequentially can dominate wall-clock time even though the payload of each request
+/// is tiny.
+///
+/// A single request with a multipart `Range` header (e.g. `bytes=0-50, 100-150`) would
+/// be ideal, but most object stores don't support it: e.g. AWS S3 silently ignores
+/// multi-range `Range` headers and returns the *entire* object with a `200 OK` instead of
+/// an error, which would be far worse than doing many small requests. Instead, children
+/// whose metadata blocks are close together are coalesced into a single contiguous
+/// ranged request, and the (still limited) number of resulting requests are fetched concurrently.
+async fn find_child_by_name<Backend: OmFileReaderBackendAsync + Send + Sync + 'static>(
+    backend: &Arc<Backend>,
+    parent: &OmVariablePtr,
+    number_of_children: u32,
+    name: &str,
+) -> Option<OmFileReaderAsync<Backend>> {
+    // Gap (in bytes) below which two neighboring children are merged into a single request.
+    const MERGE_GAP: u64 = 512;
+
+    // Collect (child_index, offset, size) first; this requires no I/O.
+    let mut children = Vec::with_capacity(number_of_children as usize);
+    for index in 0..number_of_children {
+        let mut offset = 0u64;
+        let mut size = 0u64;
+        let has_child =
+            unsafe { om_variable_get_children(parent.ptr, index, 1, &mut offset, &mut size) };
+        if has_child {
+            children.push((index, offset, size));
+        }
+    }
+    children.sort_by_key(|&(_, offset, _)| offset);
+
+    // Group neighboring children into batches that can be fetched with one ranged request.
+    let mut groups: Vec<Vec<(u32, u64, u64)>> = Vec::new();
+    for child in children {
+        let (_, offset, _) = child;
+        if let Some(group) = groups.last_mut() {
+            let &(_, last_offset, last_size) = group.last().unwrap();
+            if offset <= last_offset + last_size + MERGE_GAP {
+                group.push(child);
+                continue;
+            }
+        }
+        groups.push(vec![child]);
+    }
+
+    let semaphore = Arc::new(Semaphore::new(16));
+    let mut task_handles = Vec::with_capacity(groups.len());
+
+    for group in groups {
+        let group_start = group.first().unwrap().1;
+        let group_end = group
+            .iter()
+            .map(|&(_, offset, size)| offset + size)
+            .max()
+            .unwrap();
+        let backend = backend.clone();
+        let semaphore = semaphore.clone();
+
+        task_handles.push(get_executor().spawn(async move {
+            let _permit = semaphore.acquire_arc().await;
+            let group_data = backend
+                .get_bytes_async(group_start, group_end - group_start)
+                .await?;
+
+            let mut readers = Vec::with_capacity(group.len());
+            for (index, offset, size) in group {
+                let start = (offset - group_start) as usize;
+                let variable = OmVariablePtr::new(group_data[start..start + size as usize].to_vec())?;
+                readers.push((
+                    index,
+                    OmFileReaderAsync {
+                        backend: backend.clone(),
+                        variable,
+                        offset_size: OmOffsetSize::new(offset, size),
+                    },
+                ));
+            }
+            Ok::<_, OmFilesError>(readers)
+        }));
+    }
+
+    // Preserve the original semantics of returning the lowest-index match,
+    // even though the requests above complete out of order.
+    let mut found: Option<(u32, OmFileReaderAsync<Backend>)> = None;
+    get_executor()
+        .run(async {
+            for handle in task_handles {
+                if let Ok(readers) = handle.await {
+                    for (index, reader) in readers {
+                        if reader.name() == name && found.as_ref().is_none_or(|&(i, _)| index < i) {
+                            found = Some((index, reader));
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+    found.map(|(_, reader)| reader)
+}
+
