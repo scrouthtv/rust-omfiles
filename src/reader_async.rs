@@ -313,11 +313,34 @@ impl<'a, Backend: OmFileReaderBackendAsync + Send + Sync + 'static> OmFileAsyncA
                 },
             )?;
 
-            let mut task_handles: Vec<Task<Result<(Backend::Bytes, OmRange_t), OmFilesError>>> =
-                Vec::with_capacity(chunk_infos.len());
+            // Coalesce chunk reads that are close together into a single ranged request:
+            // many chunks are just a few hundred bytes, so the network round trip cost
+            // dominates far more than the extra bytes transferred by fetching them together.
+            chunk_infos.sort_by_key(|&(offset, _, _)| offset);
+            let mut groups: Vec<Vec<(u64, u64, OmRange_t)>> = Vec::new();
+            for chunk in chunk_infos {
+                let (offset, _, _) = chunk;
+                if let Some(group) = groups.last_mut() {
+                    let &(last_offset, last_count, _) = group.last().unwrap();
+                    if offset <= last_offset + last_count + self.io_size_merge {
+                        group.push(chunk);
+                        continue;
+                    }
+                }
+                groups.push(vec![chunk]);
+            }
 
-            // Spawn a task for each chunk info
-            for (offset, count, chunk_index) in chunk_infos {
+            let mut task_handles: Vec<Task<Result<Vec<(Vec<u8>, OmRange_t)>, OmFilesError>>> =
+                Vec::with_capacity(groups.len());
+
+            // Spawn a task per group of nearby chunks
+            for group in groups {
+                let group_start = group.first().unwrap().0;
+                let group_end = group
+                    .iter()
+                    .map(|&(offset, count, _)| offset + count)
+                    .max()
+                    .unwrap();
                 let backend = self.backend.clone();
                 let semaphore_clone = self.semaphore.clone();
 
@@ -325,26 +348,33 @@ impl<'a, Backend: OmFileReaderBackendAsync + Send + Sync + 'static> OmFileAsyncA
                     // Acquire permit limiting concurrency
                     let permit = semaphore_clone.acquire_arc().await;
 
-                    // Fetch data and attach chunk index
-                    let data = backend.get_bytes_async(offset, count).await?;
-                    let result = Ok((data, chunk_index));
+                    // Fetch the merged range once and slice it back out per chunk
+                    let group_data = backend
+                        .get_bytes_async(group_start, group_end - group_start)
+                        .await?;
+
+                    let mut result = Vec::with_capacity(group.len());
+                    for (offset, count, chunk_index) in group {
+                        let start = (offset - group_start) as usize;
+                        let data = group_data[start..start + count as usize].to_vec();
+                        result.push((data, chunk_index));
+                    }
 
                     // Release permit
                     drop(permit);
 
-                    result
+                    Ok(result)
                 });
                 task_handles.push(task);
             }
 
             // Run the executor to process all tasks
-            let mut chunk_data: Vec<(Backend::Bytes, OmRange_t)> =
-                Vec::with_capacity(task_handles.len());
+            let mut chunk_data: Vec<(Vec<u8>, OmRange_t)> = Vec::new();
             get_executor()
                 .run(async {
                     for handle in task_handles {
                         match handle.await {
-                            Ok(result) => chunk_data.push(result),
+                            Ok(group_result) => chunk_data.extend(group_result),
                             Err(e) => return Err(OmFilesError::TaskError(e.to_string())),
                         }
                     }
