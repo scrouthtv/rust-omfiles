@@ -32,8 +32,7 @@ impl HttpBackend {
 
         let agent_clone = agent.clone();
         let url_clone = url.clone();
-        let file_size = blocking::unblock(move || Self::fetch_content_length(&agent_clone, &url_clone))
-            .await?;
+        let file_size = Self::fetch_content_length(&agent_clone, &url_clone)?;
 
         Ok(Self {
             url,
@@ -69,12 +68,32 @@ impl HttpBackend {
             .call()
             .map_err(|e| OmFilesError::GenericError(format!("HTTP GET request failed: {e}")))?;
 
+        let status = response.status();
+        if status == 200 {
+            return Err(OmFilesError::GenericError(format!(
+                "Remote server ignored the HTTP Range request for {url} and returned status 200 OK instead of 206 Partial Content. The server must support HTTP Range requests."
+            )));
+        }
+        if status != 206 {
+            return Err(OmFilesError::GenericError(format!(
+                "Unexpected HTTP status {status} for {url} (expected 206 Partial Content)"
+            )));
+        }
+
         let mut buffer = Vec::with_capacity(count as usize);
         response
             .body_mut()
             .as_reader()
+            .take(count)
             .read_to_end(&mut buffer)
             .map_err(|e| OmFilesError::GenericError(format!("Failed to read HTTP response body: {e}")))?;
+
+        if buffer.len() as u64 != count {
+            return Err(OmFilesError::GenericError(format!(
+                "HTTP Range request returned {} bytes, but expected {count} bytes",
+                buffer.len()
+            )));
+        }
 
         Ok(buffer)
     }
@@ -90,6 +109,6 @@ impl OmFileReaderBackendAsync for HttpBackend {
     async fn get_bytes_async(&self, offset: u64, count: u64) -> Result<Self::Bytes, OmFilesError> {
         let agent = self.agent.clone();
         let url = self.url.clone();
-        blocking::unblock(move || Self::fetch_range(&agent, &url, offset, count)).await
+        Self::fetch_range(&agent, &url, offset, count)
     }
 }
